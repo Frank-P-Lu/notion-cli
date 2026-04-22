@@ -1,6 +1,11 @@
-import { UnauthorizedError } from "@modelcontextprotocol/sdk/client/auth.js";
+import {
+	discoverOAuthServerInfo,
+	refreshAuthorization,
+	UnauthorizedError,
+} from "@modelcontextprotocol/sdk/client/auth.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import type { OAuthClientInformationFull } from "@modelcontextprotocol/sdk/shared/auth.js";
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 import { CallbackServer } from "../auth/callback-server.js";
 import { NotionOAuthProvider } from "../auth/provider.js";
@@ -29,6 +34,10 @@ export class MCPConnection {
 		if (savedPort !== undefined && callbackServer.port !== savedPort) {
 			tokenStore.deleteClientInfo();
 		}
+
+		// Proactively refresh the access token if it's expired or near expiry.
+		// This prevents the refresh token itself from expiring due to inactivity.
+		await tryProactiveRefresh(tokenStore);
 
 		const callbackPromise = callbackServer.waitForCallback();
 
@@ -180,6 +189,30 @@ function mcpErrorToCliError(toolName: string, result: Record<string, unknown>): 
 	const message = extractMcpErrorMessage(result);
 	const rule = HINT_RULES.find((r) => r.pattern.test(message) && (!r.tool || r.tool === toolName));
 	return new CliError(`${toolName} failed`, message, rule?.hint);
+}
+
+async function tryProactiveRefresh(tokenStore: TokenStore): Promise<void> {
+	if (!tokenStore.isAccessTokenExpired()) return;
+
+	const tokens = tokenStore.readTokens();
+	const refreshToken = tokens?.refresh_token;
+	if (typeof refreshToken !== "string") return;
+
+	const clientInfo = tokenStore.readClientInfo() as OAuthClientInformationFull | undefined;
+	if (!clientInfo) return;
+
+	try {
+		const { authorizationServerUrl, authorizationServerMetadata } =
+			await discoverOAuthServerInfo(MCP_SERVER_URL);
+		const newTokens = await refreshAuthorization(new URL(authorizationServerUrl), {
+			metadata: authorizationServerMetadata,
+			clientInformation: clientInfo,
+			refreshToken,
+		});
+		tokenStore.saveTokens(newTokens as unknown as Record<string, unknown>);
+	} catch {
+		// Silent — the normal connect flow handles auth errors (401 → browser)
+	}
 }
 
 export function extractPortFromClientInfo(

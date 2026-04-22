@@ -41,7 +41,18 @@ export class TokenStore {
 	}
 
 	saveTokens(tokens: Record<string, unknown>): void {
-		this.writeJson("tokens.json", tokens);
+		const expiresIn = typeof tokens.expires_in === "number" ? tokens.expires_in : undefined;
+		const withExpiry =
+			expiresIn !== undefined
+				? { ...tokens, expires_at: Math.floor(Date.now() / 1000) + expiresIn }
+				: tokens;
+		this.writeJson("tokens.json", withExpiry);
+	}
+
+	isAccessTokenExpired(bufferSeconds = 300): boolean {
+		const data = this.readJson<{ expires_at?: number }>("tokens.json");
+		if (data?.expires_at === undefined) return false;
+		return Date.now() / 1000 > data.expires_at - bufferSeconds;
 	}
 
 	deleteTokens(): void {

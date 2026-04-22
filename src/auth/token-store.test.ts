@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TokenStore } from "./token-store.js";
 
 describe("TokenStore", () => {
@@ -25,7 +25,23 @@ describe("TokenStore", () => {
 		it("saves and reads tokens", () => {
 			const tokens = { access_token: "abc", refresh_token: "def", expires_in: 3600 };
 			store.saveTokens(tokens);
-			expect(store.readTokens()).toEqual(tokens);
+			const saved = store.readTokens();
+			expect(saved).toMatchObject(tokens);
+		});
+
+		it("adds expires_at when saving tokens with expires_in", () => {
+			const fakeNow = 1_000_000_000;
+			vi.setSystemTime(fakeNow * 1000);
+			store.saveTokens({ access_token: "abc", expires_in: 3600 });
+			vi.useRealTimers();
+			const saved = store.readTokens() as Record<string, unknown>;
+			expect(saved?.expires_at).toBe(fakeNow + 3600);
+		});
+
+		it("does not add expires_at when expires_in is missing", () => {
+			store.saveTokens({ access_token: "abc" });
+			const saved = store.readTokens() as Record<string, unknown>;
+			expect(saved?.expires_at).toBeUndefined();
 		});
 
 		it("deletes tokens", () => {
@@ -42,6 +58,57 @@ describe("TokenStore", () => {
 			store.saveTokens({ access_token: "abc" });
 			const stat = fs.statSync(path.join(tmpDir, "tokens.json"));
 			expect(stat.mode & 0o777).toBe(0o600);
+		});
+	});
+
+	describe("isAccessTokenExpired", () => {
+		afterEach(() => {
+			vi.useRealTimers();
+		});
+
+		it("returns false when no tokens saved", () => {
+			expect(store.isAccessTokenExpired()).toBe(false);
+		});
+
+		it("returns false when expires_at is missing", () => {
+			store.saveTokens({ access_token: "abc" });
+			expect(store.isAccessTokenExpired()).toBe(false);
+		});
+
+		it("returns false when token is still valid (far future expiry)", () => {
+			const fakeNow = 1_000_000_000;
+			vi.setSystemTime(fakeNow * 1000);
+			// Save with expires_in=7200 → expires_at = fakeNow + 7200
+			store.saveTokens({ access_token: "abc", expires_in: 7200 });
+			expect(store.isAccessTokenExpired()).toBe(false);
+		});
+
+		it("returns true when token is expired", () => {
+			const fakeNow = 1_000_000_000;
+			vi.setSystemTime(fakeNow * 1000);
+			store.saveTokens({ access_token: "abc", expires_in: 3600 });
+			// Advance time past expiry + buffer
+			vi.setSystemTime((fakeNow + 4000) * 1000);
+			expect(store.isAccessTokenExpired()).toBe(true);
+		});
+
+		it("returns true when token is within the 5-minute default buffer window", () => {
+			const fakeNow = 1_000_000_000;
+			vi.setSystemTime(fakeNow * 1000);
+			store.saveTokens({ access_token: "abc", expires_in: 3600 });
+			// Advance to 60s before expiry (within 300s default buffer)
+			vi.setSystemTime((fakeNow + 3540) * 1000);
+			expect(store.isAccessTokenExpired()).toBe(true);
+		});
+
+		it("respects custom buffer seconds", () => {
+			const fakeNow = 1_000_000_000;
+			vi.setSystemTime(fakeNow * 1000);
+			store.saveTokens({ access_token: "abc", expires_in: 3600 });
+			// Advance to 60s before expiry
+			vi.setSystemTime((fakeNow + 3540) * 1000);
+			expect(store.isAccessTokenExpired(30)).toBe(false); // 30s buffer, still 60s away
+			expect(store.isAccessTokenExpired(120)).toBe(true); // 120s buffer, only 60s away
 		});
 	});
 

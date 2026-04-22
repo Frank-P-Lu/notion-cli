@@ -1,6 +1,7 @@
 import { Command } from "commander";
 import { describe, expect, it } from "vitest";
 import {
+	buildPageAppendCall,
 	buildPageCreateCall,
 	buildPageDuplicateCall,
 	buildPageMoveCall,
@@ -169,6 +170,55 @@ describe("buildPageDuplicateCall", () => {
 	});
 });
 
+describe("buildPageAppendCall", () => {
+	it("converts --body text to Notion blocks", () => {
+		const result = buildPageAppendCall("page-id", { body: "Hello world" });
+		expect(result.path).toBe("/blocks/page-id/children");
+		expect(result.body).toEqual({
+			children: [
+				{
+					object: "block",
+					type: "paragraph",
+					paragraph: {
+						rich_text: [{ type: "text", text: { content: "Hello world" } }],
+					},
+				},
+			],
+		});
+	});
+
+	it("converts headings and bullets", () => {
+		const result = buildPageAppendCall("page-id", { body: "# Title\n- Item" });
+		const children = result.body.children as Record<string, unknown>[];
+		expect(children).toHaveLength(2);
+		expect(children[0].type).toBe("heading_1");
+		expect(children[1].type).toBe("bulleted_list_item");
+	});
+
+	it("--data overrides --body", () => {
+		const result = buildPageAppendCall("page-id", {
+			body: "Ignored",
+			data: '{"children":[{"custom":"block"}]}',
+		});
+		expect(result.body).toEqual({ children: [{ custom: "block" }] });
+	});
+
+	it("throws CliError when no body or data is provided", () => {
+		expect(() => buildPageAppendCall("page-id", {})).toThrow("No content to append");
+	});
+
+	it("throws CliError when body is empty/whitespace", () => {
+		expect(() => buildPageAppendCall("page-id", { body: "  \n  " })).toThrow(
+			"No content to append",
+		);
+	});
+
+	it("uses the page ID in the REST path", () => {
+		const result = buildPageAppendCall("abc-123-def", { body: "test" });
+		expect(result.path).toBe("/blocks/abc-123-def/children");
+	});
+});
+
 describe("registerPageCommands", () => {
 	it("registers page command group with subcommands", () => {
 		const program = new Command();
@@ -181,5 +231,6 @@ describe("registerPageCommands", () => {
 		expect(subcommandNames).toContain("update");
 		expect(subcommandNames).toContain("move");
 		expect(subcommandNames).toContain("duplicate");
+		expect(subcommandNames).toContain("append");
 	});
 });

@@ -1,6 +1,8 @@
 import type { Command } from "commander";
 import { withConnection } from "../mcp/with-connection.js";
-import { printOutput } from "../output/json.js";
+import { printOutput, printRestOutput } from "../output/json.js";
+import { withRestClient } from "../rest/with-rest-client.js";
+import { textToBlocks } from "../util/blocks.js";
 import { CliError, parseJsonData } from "../util/errors.js";
 import { parseProps } from "../util/props.js";
 import { readStdin } from "../util/stdin.js";
@@ -117,6 +119,34 @@ export function buildPageDuplicateCall(id: string): {
 	return { tool: "notion-duplicate-page", args: { page_id: id } };
 }
 
+export function buildPageAppendCall(
+	id: string,
+	opts: { body?: string; data?: string },
+): {
+	path: string;
+	body: Record<string, unknown>;
+} {
+	if (opts.data) {
+		return { path: `/blocks/${id}/children`, body: parseJsonData(opts.data) };
+	}
+	if (!opts.body) {
+		throw new CliError(
+			"No content to append",
+			"--body or --data is required",
+			'Provide content: ncli page append <id> --body "# New section"',
+		);
+	}
+	const children = textToBlocks(opts.body);
+	if (children.length === 0) {
+		throw new CliError(
+			"No content to append",
+			"The provided text produced no blocks (empty or whitespace-only)",
+			"Provide non-empty content with --body",
+		);
+	}
+	return { path: `/blocks/${id}/children`, body: { children } };
+}
+
 async function resolveBody(body: string | undefined): Promise<string | undefined> {
 	if (body === "-") {
 		return readStdin();
@@ -215,6 +245,41 @@ For DB pages: run "ncli fetch <db-id>" first to get the data_source_id (collecti
 			await withConnection(async (conn) => {
 				const result = await conn.callTool(tool, args);
 				printOutput(result as Record<string, unknown>, cmd.optsWithGlobals());
+			});
+		});
+
+	page
+		.command("append")
+		.description("Append content to a page (REST API — preserves existing blocks)")
+		.argument("<id>", "Page ID (also accepts block ID)")
+		.option("--body <text>", 'Content to append — markdown-like syntax (use "-" for stdin)')
+		.option("--data <json>", "Raw JSON body for PATCH /blocks/{id}/children (overrides --body)")
+		.addHelpText(
+			"after",
+			`
+Examples:
+  ncli page append <page-id> --body "# New section"
+  ncli page append <page-id> --body "- item 1\\n- item 2"
+  echo "Appended paragraph" | ncli page append <page-id> --body -
+  ncli page append <page-id> --data '{"children":[{"object":"block","type":"paragraph","paragraph":{"rich_text":[{"type":"text","text":{"content":"raw block"}}]}}]}'
+
+Supported markdown syntax:
+  # Heading 1, ## Heading 2, ### Heading 3
+  - Bullet list item  (* also works)
+  1. Numbered list item
+  > Quote
+  --- (divider)
+  Plain text → paragraph
+
+Note: Uses REST API (integration token). Run "ncli rest login" first.
+Unlike "page update --body" (which replaces all content), this preserves existing blocks.`,
+		)
+		.action(async (id: string, opts: { body?: string; data?: string }, cmd: Command) => {
+			opts.body = await resolveBody(opts.body);
+			const call = buildPageAppendCall(id, opts);
+			await withRestClient(async (client) => {
+				const result = await client.request("PATCH", call.path, call.body);
+				printRestOutput(result, cmd.optsWithGlobals());
 			});
 		});
 }

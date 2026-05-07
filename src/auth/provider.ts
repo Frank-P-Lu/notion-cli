@@ -46,6 +46,29 @@ export class NotionOAuthProvider implements OAuthClientProvider {
 		this.tokenStore.saveTokens(tokens as unknown as Record<string, unknown>);
 	}
 
+	async invalidateCredentials(
+		scope: "all" | "client" | "tokens" | "verifier" | "discovery",
+	): Promise<void> {
+		switch (scope) {
+			case "all":
+				this.tokenStore.deleteTokens();
+				this.tokenStore.deleteClientInfo();
+				this.tokenStore.deleteCodeVerifier();
+				break;
+			case "client":
+				this.tokenStore.deleteClientInfo();
+				break;
+			case "tokens":
+				this.tokenStore.deleteTokens();
+				break;
+			case "verifier":
+				this.tokenStore.deleteCodeVerifier();
+				break;
+			case "discovery":
+				break;
+		}
+	}
+
 	codeVerifier(): string {
 		const verifier = this.tokenStore.readCodeVerifier();
 		if (!verifier) {

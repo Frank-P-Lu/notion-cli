@@ -6,9 +6,17 @@ import {
 	buildPageDuplicateCall,
 	buildPageMoveCall,
 	buildPageUpdateCall,
+	extractPageBody,
+	findAppendAnchor,
 	parseParentRef,
 	registerPageCommands,
 } from "./page.js";
+
+function fetchResult(inner: string): { content: Array<{ type: string; text: string }> } {
+	return {
+		content: [{ type: "text", text: JSON.stringify({ text: inner }) }],
+	};
+}
 
 describe("parseParentRef", () => {
 	it("detects collection:// as data_source_id and strips the prefix", () => {
@@ -170,52 +178,132 @@ describe("buildPageDuplicateCall", () => {
 	});
 });
 
+describe("extractPageBody", () => {
+	it("detects a blank page", () => {
+		const r = fetchResult("<page>\n<blank-page>This page is blank.</blank-page>\n</page>");
+		expect(extractPageBody(r)).toEqual({ blank: true, markdown: "" });
+	});
+
+	it("extracts markdown between <content> tags", () => {
+		const r = fetchResult("<page>\n<content>\nLine A\nLine B\n</content>\n</page>");
+		expect(extractPageBody(r)).toEqual({ blank: false, markdown: "Line A\nLine B" });
+	});
+
+	it("throws when payload is malformed", () => {
+		const bad = { content: [{ type: "text", text: "not json" }] };
+		expect(() => extractPageBody(bad)).toThrow("Could not parse page body");
+	});
+
+	it("throws when neither <content> nor <blank-page> is present", () => {
+		const r = fetchResult("<page>\n<properties>{}</properties>\n</page>");
+		expect(() => extractPageBody(r)).toThrow("Could not locate page content");
+	});
+});
+
+describe("findAppendAnchor", () => {
+	it("returns the last non-empty line when unique", () => {
+		expect(findAppendAnchor("Alpha\nBeta\nGamma")).toBe("Gamma");
+	});
+
+	it("ignores trailing empty lines", () => {
+		expect(findAppendAnchor("Alpha\nBeta\n\n")).toBe("Beta");
+	});
+
+	it("walks back until the anchor is unique", () => {
+		const md = "- todo\n- todo\n- todo\nDone";
+		expect(findAppendAnchor(md)).toBe("Done");
+	});
+
+	it("extends the anchor when the last line is duplicated", () => {
+		const md = "- item\nfooter\n- item";
+		expect(findAppendAnchor(md)).toBe("footer\n- item");
+	});
+
+	it("returns the whole markdown when nothing is unique", () => {
+		expect(findAppendAnchor("x\nx")).toBe("x\nx");
+	});
+
+	it("skips trailing image lines (presigned URLs are not stable)", () => {
+		const md = "Real text\n![](https://prod-files-secure.s3.example/foo.png?sig=abc)";
+		expect(findAppendAnchor(md)).toBe("Real text");
+	});
+
+	it("skips multiple trailing image lines", () => {
+		const md = "Real text\n![](https://a.png?x=1)\n![alt](https://b.png?y=2)";
+		expect(findAppendAnchor(md)).toBe("Real text");
+	});
+
+	it("throws when no stable line exists", () => {
+		expect(() => findAppendAnchor("![](https://a.png?x=1)\n![](https://b.png?y=2)")).toThrow(
+			"Could not find a stable anchor",
+		);
+	});
+});
+
 describe("buildPageAppendCall", () => {
-	it("converts --body text to Notion blocks", () => {
-		const result = buildPageAppendCall("page-id", { body: "Hello world" });
-		expect(result.path).toBe("/blocks/page-id/children");
-		expect(result.body).toEqual({
-			children: [
-				{
-					object: "block",
-					type: "paragraph",
-					paragraph: {
-						rich_text: [{ type: "text", text: { content: "Hello world" } }],
-					},
-				},
-			],
+	it("uses replace_content for blank pages", () => {
+		const result = buildPageAppendCall(
+			"page-id",
+			{ blank: true, markdown: "" },
+			{ body: "# Hello" },
+		);
+		expect(result.tool).toBe("notion-update-page");
+		expect(result.args).toEqual({
+			page_id: "page-id",
+			command: "replace_content",
+			new_str: "# Hello",
 		});
 	});
 
-	it("converts headings and bullets", () => {
-		const result = buildPageAppendCall("page-id", { body: "# Title\n- Item" });
-		const children = result.body.children as Record<string, unknown>[];
-		expect(children).toHaveLength(2);
-		expect(children[0].type).toBe("heading_1");
-		expect(children[1].type).toBe("bulleted_list_item");
+	it("uses update_content with trailing-line anchor for non-blank pages", () => {
+		const result = buildPageAppendCall(
+			"page-id",
+			{ blank: false, markdown: "Line A\nLine B" },
+			{ body: "## New" },
+		);
+		expect(result.tool).toBe("notion-update-page");
+		expect(result.args).toEqual({
+			page_id: "page-id",
+			command: "update_content",
+			content_updates: [{ old_str: "Line B", new_str: "Line B\n\n## New" }],
+		});
 	});
 
-	it("--data overrides --body", () => {
-		const result = buildPageAppendCall("page-id", {
-			body: "Ignored",
-			data: '{"children":[{"custom":"block"}]}',
+	it("widens the anchor when the last line is not unique", () => {
+		const result = buildPageAppendCall(
+			"page-id",
+			{ blank: false, markdown: "- item\nfooter\n- item" },
+			{ body: "next" },
+		);
+		const updates = result.args.content_updates as Array<{ old_str: string; new_str: string }>;
+		expect(updates[0].old_str).toBe("footer\n- item");
+		expect(updates[0].new_str).toBe("footer\n- item\n\nnext");
+	});
+
+	it("--data overrides --body and skips anchor logic", () => {
+		const result = buildPageAppendCall(
+			"page-id",
+			{ blank: false, markdown: "anything" },
+			{ body: "Ignored", data: '{"page_id":"x","command":"update_content","content_updates":[]}' },
+		);
+		expect(result.tool).toBe("notion-update-page");
+		expect(result.args).toEqual({
+			page_id: "x",
+			command: "update_content",
+			content_updates: [],
 		});
-		expect(result.body).toEqual({ children: [{ custom: "block" }] });
 	});
 
 	it("throws CliError when no body or data is provided", () => {
-		expect(() => buildPageAppendCall("page-id", {})).toThrow("No content to append");
-	});
-
-	it("throws CliError when body is empty/whitespace", () => {
-		expect(() => buildPageAppendCall("page-id", { body: "  \n  " })).toThrow(
+		expect(() => buildPageAppendCall("page-id", { blank: true, markdown: "" }, {})).toThrow(
 			"No content to append",
 		);
 	});
 
-	it("uses the page ID in the REST path", () => {
-		const result = buildPageAppendCall("abc-123-def", { body: "test" });
-		expect(result.path).toBe("/blocks/abc-123-def/children");
+	it("throws CliError when body is empty/whitespace", () => {
+		expect(() =>
+			buildPageAppendCall("page-id", { blank: true, markdown: "" }, { body: "  \n  " }),
+		).toThrow("No content to append");
 	});
 });
 

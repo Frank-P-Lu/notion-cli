@@ -1,11 +1,10 @@
 import type { Command } from "commander";
 import { withConnection } from "../mcp/with-connection.js";
-import { printOutput, printRestOutput } from "../output/json.js";
-import { withRestClient } from "../rest/with-rest-client.js";
-import { textToBlocks } from "../util/blocks.js";
+import { printOutput } from "../output/json.js";
 import { CliError, parseJsonData } from "../util/errors.js";
 import { parseProps } from "../util/props.js";
 import { readStdin } from "../util/stdin.js";
+import { buildFetchCall } from "./fetch.js";
 
 interface PageWriteOptions {
 	title?: string;
@@ -119,32 +118,129 @@ export function buildPageDuplicateCall(id: string): {
 	return { tool: "notion-duplicate-page", args: { page_id: id } };
 }
 
+interface FetchResult {
+	content?: Array<{ type: string; text: string }>;
+}
+
+interface ParsedPageBody {
+	blank: boolean;
+	markdown: string;
+}
+
+const CONTENT_OPEN = "<content>\n";
+const CONTENT_CLOSE = "\n</content>";
+const BLANK_MARKER = "<blank-page>";
+
+export function extractPageBody(result: FetchResult): ParsedPageBody {
+	const text = result.content?.[0]?.text;
+	if (typeof text !== "string") {
+		throw new CliError(
+			"Could not read page body",
+			"notion-fetch response did not contain a text payload",
+			"Try `ncli fetch <id> --raw` to inspect the response",
+		);
+	}
+	let inner: string;
+	try {
+		const parsed = JSON.parse(text) as { text?: unknown };
+		if (typeof parsed.text !== "string") throw new Error("missing text field");
+		inner = parsed.text;
+	} catch {
+		throw new CliError(
+			"Could not parse page body",
+			"notion-fetch payload was not the expected JSON shape",
+			"Try `ncli fetch <id> --raw` to inspect the response",
+		);
+	}
+	if (inner.includes(BLANK_MARKER)) {
+		return { blank: true, markdown: "" };
+	}
+	const openIdx = inner.indexOf(CONTENT_OPEN);
+	const closeIdx = inner.lastIndexOf(CONTENT_CLOSE);
+	if (openIdx === -1 || closeIdx === -1 || closeIdx < openIdx) {
+		throw new CliError(
+			"Could not locate page content",
+			"notion-fetch response had no <content> or <blank-page> section",
+			"The target may not be a regular page — try `ncli fetch <id>` to inspect",
+		);
+	}
+	return { blank: false, markdown: inner.slice(openIdx + CONTENT_OPEN.length, closeIdx) };
+}
+
+function countOccurrences(haystack: string, needle: string): number {
+	if (!needle) return 0;
+	let count = 0;
+	let idx = haystack.indexOf(needle);
+	while (idx !== -1) {
+		count++;
+		idx = haystack.indexOf(needle, idx + 1);
+	}
+	return count;
+}
+
+function isTransientLine(line: string): boolean {
+	// Notion regenerates presigned URLs in image markdown (![](https://...)) on every
+	// fetch, so anchoring on such a line never matches server-side. Skip them.
+	return /^!\[[^\]]*]\(/.test(line.trim());
+}
+
+export function findAppendAnchor(markdown: string): string {
+	const lines = markdown.split("\n");
+	let lastStable = lines.length - 1;
+	while (
+		lastStable >= 0 &&
+		(lines[lastStable].trim() === "" || isTransientLine(lines[lastStable]))
+	) {
+		lastStable--;
+	}
+	if (lastStable < 0) {
+		throw new CliError(
+			"Could not find a stable anchor",
+			"Every trailing line is an image with a presigned URL that changes per fetch",
+			"Add a plain-text line near the bottom of the page, then retry",
+		);
+	}
+	let anchor = lines[lastStable];
+	for (let i = lastStable - 1; i >= 0; i--) {
+		if (countOccurrences(markdown, anchor) === 1) return anchor;
+		anchor = `${lines[i]}\n${anchor}`;
+	}
+	return anchor;
+}
+
 export function buildPageAppendCall(
 	id: string,
+	parsed: ParsedPageBody,
 	opts: { body?: string; data?: string },
 ): {
-	path: string;
-	body: Record<string, unknown>;
+	tool: string;
+	args: Record<string, unknown>;
 } {
 	if (opts.data) {
-		return { path: `/blocks/${id}/children`, body: parseJsonData(opts.data) };
+		return { tool: "notion-update-page", args: parseJsonData(opts.data) };
 	}
-	if (!opts.body) {
+	if (!opts.body || opts.body.trim() === "") {
 		throw new CliError(
 			"No content to append",
 			"--body or --data is required",
 			'Provide content: ncli page append <id> --body "# New section"',
 		);
 	}
-	const children = textToBlocks(opts.body);
-	if (children.length === 0) {
-		throw new CliError(
-			"No content to append",
-			"The provided text produced no blocks (empty or whitespace-only)",
-			"Provide non-empty content with --body",
-		);
+	if (parsed.blank) {
+		return {
+			tool: "notion-update-page",
+			args: { page_id: id, command: "replace_content", new_str: opts.body },
+		};
 	}
-	return { path: `/blocks/${id}/children`, body: { children } };
+	const anchor = findAppendAnchor(parsed.markdown);
+	return {
+		tool: "notion-update-page",
+		args: {
+			page_id: id,
+			command: "update_content",
+			content_updates: [{ old_str: anchor, new_str: `${anchor}\n\n${opts.body}` }],
+		},
+	};
 }
 
 async function resolveBody(body: string | undefined): Promise<string | undefined> {
@@ -250,36 +346,42 @@ For DB pages: run "ncli fetch <db-id>" first to get the data_source_id (collecti
 
 	page
 		.command("append")
-		.description("Append content to a page (REST API — preserves existing blocks)")
-		.argument("<id>", "Page ID (also accepts block ID)")
-		.option("--body <text>", 'Content to append — markdown-like syntax (use "-" for stdin)')
-		.option("--data <json>", "Raw JSON body for PATCH /blocks/{id}/children (overrides --body)")
+		.description("Append markdown content to a page (preserves existing blocks)")
+		.argument("<id>", "Page ID")
+		.option("--body <text>", 'Markdown content to append (use "-" for stdin)')
+		.option("--data <json>", "Raw JSON args for notion-update-page (overrides --body)")
 		.addHelpText(
 			"after",
 			`
 Examples:
   ncli page append <page-id> --body "# New section"
-  ncli page append <page-id> --body "- item 1\\n- item 2"
+  ncli page append <page-id> --body $'- item 1\\n- item 2'
   echo "Appended paragraph" | ncli page append <page-id> --body -
-  ncli page append <page-id> --data '{"children":[{"object":"block","type":"paragraph","paragraph":{"rich_text":[{"type":"text","text":{"content":"raw block"}}]}}]}'
 
-Supported markdown syntax:
-  # Heading 1, ## Heading 2, ### Heading 3
-  - Bullet list item  (* also works)
-  1. Numbered list item
-  > Quote
-  --- (divider)
-  Plain text → paragraph
-
-Note: Uses REST API (integration token). Run "ncli rest login" first.
-Unlike "page update --body" (which replaces all content), this preserves existing blocks.`,
+Body is markdown — same syntax as "page update --body" (headings, lists, quotes, etc.).
+Unlike "page update --body" (which replaces all content), append fetches the page, anchors
+on the last unique chunk of existing content, and inserts the new body after it. For blank
+pages, falls back to replace_content.`,
 		)
 		.action(async (id: string, opts: { body?: string; data?: string }, cmd: Command) => {
 			opts.body = await resolveBody(opts.body);
-			const call = buildPageAppendCall(id, opts);
-			await withRestClient(async (client) => {
-				const result = await client.request("PATCH", call.path, call.body);
-				printRestOutput(result, cmd.optsWithGlobals());
+			if (!opts.data && (!opts.body || opts.body.trim() === "")) {
+				throw new CliError(
+					"No content to append",
+					"--body or --data is required",
+					'Provide content: ncli page append <id> --body "# New section"',
+				);
+			}
+			await withConnection(async (conn) => {
+				let parsed: ParsedPageBody = { blank: false, markdown: "" };
+				if (!opts.data) {
+					const fetchCall = buildFetchCall(id);
+					const fetchResult = await conn.callTool(fetchCall.tool, fetchCall.args);
+					parsed = extractPageBody(fetchResult as FetchResult);
+				}
+				const { tool, args } = buildPageAppendCall(id, parsed, opts);
+				const result = await conn.callTool(tool, args);
+				printOutput(result as Record<string, unknown>, cmd.optsWithGlobals());
 			});
 		});
 }
